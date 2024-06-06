@@ -130,7 +130,7 @@ class RayGPUExecutor(DistributedGPUExecutor):
 
         # Get the set of GPU IDs used on each node.
         worker_node_and_gpu_ids = self._run_workers("get_node_and_gpu_ids",
-                                                    use_dummy_driver=True)
+                                                    use_dummy_driver=True) # a method only for ray executor
 
         node_workers = defaultdict(list)
         node_gpus = defaultdict(list)
@@ -166,12 +166,13 @@ class RayGPUExecutor(DistributedGPUExecutor):
                 distributed_init_method=distributed_init_method,
             ) for rank, (node_id, _) in enumerate(worker_node_and_gpu_ids)
         ]
-        self._run_workers("init_worker", all_kwargs=init_worker_all_kwargs)
+        self._run_workers("init_worker", all_kwargs=init_worker_all_kwargs) # in WorkerWrapperBase, based on worker_module_name and worker_class_name
 
-        self._run_workers("init_device")
+        self._run_workers("init_device") # in vllm.worker.Worker, will call init_worker_distributed_environment()
         self._run_workers("load_model",
                           max_concurrent_workers=self.parallel_config.
-                          max_parallel_loading_workers)
+                          max_parallel_loading_workers) # in vllm.worker.Worker, 
+                                                        # will call model_runner.load_model() -> get_model() -> _initialize_model()
 
     def _driver_execute_model(
         self,
@@ -183,7 +184,7 @@ class RayGPUExecutor(DistributedGPUExecutor):
         loop running in each of the remote workers.
         """
         return self.driver_worker.execute_method("execute_model",
-                                                 execute_model_req)
+                                                 execute_model_req) # in vllm.worker.Worker, will call model_runner.execute_model()
 
     def _run_workers(
         self,
