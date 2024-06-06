@@ -16,6 +16,8 @@ Easy, fast, and cheap LLM serving for everyone
 
 ---
 
+On a new branch for combing vLLM and MoE.  
+
 **Ray Summit CPF is Open (June 4th to June 20th)!**
 
 There will be a track for vLLM at the Ray Summit (09/30-10/02, SF) this year!
