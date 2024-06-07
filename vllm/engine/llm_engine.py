@@ -40,7 +40,7 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import Counter
 
 logger = init_logger(__name__)
-_LOCAL_LOGGING_INTERVAL_SEC = 5
+_LOCAL_LOGGING_INTERVAL_SEC = 1 # 5 in original vLLM
 
 
 def _load_generation_config_dict(model_config: ModelConfig):

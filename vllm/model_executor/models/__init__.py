@@ -38,6 +38,7 @@ _GENERATION_MODELS = {
     "MistralForCausalLM": ("llama", "LlamaForCausalLM"),
     "MixtralForCausalLM": ("mixtral", "MixtralForCausalLM"),
     "TPMoEForCausalLM": ("tp_moe_mixtral", "TPMoEForCausalLM"),
+    "EPMoEForCausalLM": ("ep_moe_mixtral", "EPMoEForCausalLM"),
     "QuantMixtralForCausalLM": ("mixtral_quant", "MixtralForCausalLM"),
     # transformers's mpt class has lower case
     "MptForCausalLM": ("mpt", "MPTForCausalLM"),

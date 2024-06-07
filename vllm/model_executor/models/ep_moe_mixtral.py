@@ -321,7 +321,7 @@ class MixtralAttention(nn.Module):
         return output
 
 
-class MixtralDecoderLayer(nn.Module):
+class EPMixtralDecoderLayer(nn.Module):
 
     def __init__(
         self,
@@ -381,7 +381,7 @@ class MixtralDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class TPMoEModel(nn.Module):
+class EPMoEModel(nn.Module):
 
     def __init__(
         self,
@@ -403,7 +403,7 @@ class TPMoEModel(nn.Module):
             org_num_embeddings=config.vocab_size,
         )
         self.layers = nn.ModuleList([
-            MixtralDecoderLayer(config,
+            EPMixtralDecoderLayer(config,
                                 cache_config,
                                 quant_config=quant_config)
             for _ in range(config.num_hidden_layers)
@@ -428,7 +428,7 @@ class TPMoEModel(nn.Module):
         return hidden_states
 
 
-class TPMoEForCausalLM(nn.Module):
+class EPMoEForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     packed_modules_mapping = {
@@ -462,7 +462,7 @@ class TPMoEForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.model = TPMoEModel(config,
+        self.model = EPMoEModel(config,
                                   cache_config,
                                   quant_config,
                                   lora_config=lora_config)

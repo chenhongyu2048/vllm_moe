@@ -172,6 +172,8 @@ class WorkerLoRAManager(AbstractWorkerLoRAManager):
                         packed_modules_mapping[module])
                 else:
                     expected_lora_modules.append(module)
+            # from vllm.distributed import get_tensor_model_parallel_rank
+            # print(f"{get_tensor_model_parallel_rank()} {expected_lora_modules}")
             lora = self._lora_model_cls.from_local_checkpoint(
                 lora_request.lora_local_path,
                 expected_lora_modules,
