@@ -525,3 +525,65 @@ def fused_moe(
                          w2_scale=w2_scale,
                          a1_scale=a1_scale,
                          a2_scale=a2_scale)
+
+def fused_moe_ep(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    inplace: bool = False,
+    override_config: Optional[Dict[str, Any]] = None,
+    use_fp8: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    This function computes a Mixture of Experts (MoE) layer using two sets of
+    weights, w1 and w2, and top-k gating mechanism.
+
+    Parameters:
+    - hidden_states (torch.Tensor): The input tensor to the MoE layer.
+    - w1 (torch.Tensor): The first set of expert weights.
+    - w2 (torch.Tensor): The second set of expert weights.
+    - gating_output (torch.Tensor): The output of the gating operation
+        (before softmax).
+    - topk (int): The number of top-k experts to select.
+    - renormalize (bool): If True, renormalize the top-k weights to sum to 1.
+    - inplace (bool): If True, perform the operation in-place.
+        Defaults to False.
+    - override_config (Optional[Dict[str, Any]]): Optional override
+        for the kernel configuration.
+    - use_fp8 (bool): If True, use fp8 arithmetic to compute the inner
+        products for w1 and w2. Defaults to False.
+    - w1_scale (Optional[torch.Tensor]): Optional scale to be used for
+        w1.
+    - w2_scale (Optional[torch.Tensor]): Optional scale to be used for
+        w2.
+
+    Returns:
+    - torch.Tensor: The output tensor after applying the MoE layer.
+    """
+    # NOT USE the Check constraints.
+    # assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
+
+    topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk,
+                                        renormalize)
+    num_experts = w1.shape[0]
+    topk_ids = topk_ids % num_experts
+    
+    return fused_experts(hidden_states,
+                         w1,
+                         w2,
+                         topk_weights,
+                         topk_ids,
+                         inplace=inplace,
+                         override_config=override_config,
+                         use_fp8=use_fp8,
+                         w1_scale=w1_scale,
+                         w2_scale=w2_scale,
+                         a1_scale=a1_scale,
+                         a2_scale=a2_scale)
