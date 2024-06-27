@@ -31,10 +31,10 @@ from transformers import MixtralConfig
 from vllm import _custom_ops as ops
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, LoRAConfig
-from vllm.distributed import (get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce,
-                              get_tensor_model_parallel_group)
+from vllm.distributed import (get_tensor_model_parallel_world_size,
+                              get_expert_parallel_rank,
+                              get_expert_parallel_world_size,
+                              get_expert_parallel_group)
 from vllm.model_executor.layers.fused_moe import fused_moe, fused_moe_ep, fused_topk
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
@@ -54,6 +54,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import SamplerOutput
 import torch.nn.functional as F
 from vllm.utils import print_warning_once
+import time
 
 # einsum rewrites are on par or more performant
 # switch can be bubbled up in future
@@ -99,6 +100,7 @@ def gate_and_alltoall(router_logits, hidden_states, top_k):
     num_total_experts = router_logits.shape[1]
     hidden_size = hidden_states.shape[1]
     topk_weights, topk_ids = fused_topk(hidden_states, router_logits, top_k, renormalize=True)
+    topk_ids = topk_ids.to(torch.int64)
     mask1 = F.one_hot(topk_ids[:, 0], num_classes=num_total_experts)
     mask2 = F.one_hot(topk_ids[:, 1], num_classes=num_total_experts)
     
@@ -110,10 +112,9 @@ def gate_and_alltoall(router_logits, hidden_states, top_k):
     
     exp_counts = torch.sum(mask1 + mask2, dim=0)
     new_capacity = torch.max(exp_counts)
-    if True: # use_padding is default True now
-        torch.distributed.all_reduce(new_capacity, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group())
+    torch.distributed.all_reduce(new_capacity, op=torch.distributed.ReduceOp.MAX, group=get_expert_parallel_group())
     capacity = new_capacity
-    
+    # print(f"capacity: {capacity}")
     # Store the capacity location for each token
     locations1_s = torch.sum(locations1 * mask1, dim=1)
     locations2_s = torch.sum(locations2 * mask2, dim=1)
@@ -130,9 +131,55 @@ def gate_and_alltoall(router_logits, hidden_states, top_k):
 
     # build tensor for comm
     dispatched_hidden_states = einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), hidden_states)
-    dispatched_input = torch.empty_like(dispatched_hidden_states) # [e, c, m]
+    dispatched_input = torch.ones_like(dispatched_hidden_states) # [e, c, m]
     
-    torch.distributed.all_to_all_single(dispatched_input, dispatched_hidden_states, group=get_tensor_model_parallel_group())
+    torch.distributed.all_to_all_single(dispatched_input, dispatched_hidden_states, group=get_expert_parallel_group())
+    
+    return dispatched_input, combine_weights
+
+def gate_and_alltoall_sparse(router_logits, hidden_states, top_k):
+    """Sparse implementation of all-to-all.
+    This is the first all-to-all, which is before Experts computing.
+    """
+    num_total_experts = router_logits.shape[1]
+    hidden_size = hidden_states.shape[1]
+    topk_weights, topk_ids = fused_topk(hidden_states, router_logits, top_k, renormalize=True)
+    topk_ids = topk_ids.to(torch.int64)
+    mask1 = F.one_hot(topk_ids[:, 0], num_classes=num_total_experts)
+    mask2 = F.one_hot(topk_ids[:, 1], num_classes=num_total_experts)
+    
+    # Compute locations in capacity buffer
+    locations1 = torch.cumsum(mask1, dim=0) - 1
+    locations2 = torch.cumsum(mask2, dim=0) - 1
+    # Update 2nd's location by accounting for locations of 1st
+    locations2 += torch.sum(mask1, dim=0, keepdim=True)
+    
+    exp_counts = torch.sum(mask1 + mask2, dim=0)
+    new_exp_cnt = torch.empty_like(exp_counts)
+    torch.distributed.all_to_all_single(new_exp_cnt, exp_counts, group=get_expert_parallel_group())
+
+    
+    
+    # print(f"capacity: {capacity}")
+    # Store the capacity location for each token
+    locations1_s = torch.sum(locations1 * mask1, dim=1)
+    locations2_s = torch.sum(locations2 * mask2, dim=1)
+    
+    # Calculate combine_weights and dispatch_mask
+    gates1_se = einsum("s,se->se", topk_weights[:, 0], mask1.float())
+    gates2_se = einsum("s,se->se", topk_weights[:, 1], mask2.float())
+    locations1_sc = F.one_hot(locations1_s, capacity).float()
+    locations2_sc = F.one_hot(locations2_s, capacity).float()
+    combine1_sec = einsum("se,sc->sec", gates1_se, locations1_sc)
+    combine2_sec = einsum("se,sc->sec", gates2_se, locations2_sc)
+    combine_weights = combine1_sec + combine2_sec # [s, e, c]
+    dispatch_mask = combine_weights.bool()
+
+    # build tensor for comm
+    dispatched_hidden_states = einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), hidden_states)
+    dispatched_input = torch.ones_like(dispatched_hidden_states) # [e, c, m]
+    
+    torch.distributed.all_to_all_single(dispatched_input, dispatched_hidden_states, group=get_expert_parallel_group())
     
     return dispatched_input, combine_weights
 
@@ -146,23 +193,23 @@ class EPMixtralMoE(nn.Module):
 
     def __init__(
         self,
-        num_experts: int,
+        num_local_experts: int,
+        num_total_experts: int,
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
-        ep_size: Optional[int] = None,
         use_padding: Optional[bool] = True,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.ep_size = ep_size or get_tensor_model_parallel_world_size()
         self.use_padding = use_padding
-        self.num_total_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.num_total_experts = num_total_experts
         # arguments for expert-parallel
-        self.num_experts = num_experts // self.ep_size
-        self.ep_rank = get_tensor_model_parallel_rank()
-        self.experts = [i for i in range(self.ep_rank*self.num_experts, (self.ep_rank+1)*self.num_experts)]
+
+        self.ep_rank = get_expert_parallel_rank()
+        self.experts = [i for i in range(self.ep_rank * self.num_local_experts, (self.ep_rank + 1) * self.num_local_experts)] # not use at this moment
         
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -189,12 +236,12 @@ class EPMixtralMoE(nn.Module):
             params_dtype = torch.float8_e4m3fn
 
         self.w13_weight = nn.Parameter(
-            torch.empty(self.num_experts,
+            torch.empty(self.num_local_experts,
                         2 * self.intermediate_size,
                         self.hidden_size,
                         dtype=params_dtype))
         self.w2_weight = nn.Parameter(
-            torch.empty(self.num_experts,
+            torch.empty(self.num_local_experts,
                         self.hidden_size,
                         self.intermediate_size,
                         dtype=params_dtype))
@@ -254,19 +301,20 @@ class EPMixtralMoE(nn.Module):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor,
                       weight_name: str, expert_id: int):
-        tp_rank = get_tensor_model_parallel_rank()
-        param_data = param.data
-        shard_size = self.intermediate_size
-        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
-        if weight_name.endswith("w1.weight"):
-            param_data[expert_id, 0:shard_size, :] = loaded_weight[shard, :]
-        if weight_name.endswith("w3.weight"):
-            param_data[expert_id,
-                       shard_size:2 * shard_size, :] = loaded_weight[shard, :]
-        if weight_name.endswith("w2.weight"):
-            param_data[expert_id, :, :] = loaded_weight[:, shard]
-        if "act_scale" in weight_name or "weight_scale" in weight_name:
-            param_data[expert_id] = loaded_weight
+        raise NotImplementedError
+        # tp_rank = get_tensor_model_parallel_rank()
+        # param_data = param.data
+        # shard_size = self.intermediate_size
+        # shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        # if weight_name.endswith("w1.weight"):
+        #     param_data[expert_id, 0:shard_size, :] = loaded_weight[shard, :]
+        # if weight_name.endswith("w3.weight"):
+        #     param_data[expert_id,
+        #                shard_size:2 * shard_size, :] = loaded_weight[shard, :]
+        # if weight_name.endswith("w2.weight"):
+        #     param_data[expert_id, :, :] = loaded_weight[:, shard]
+        # if "act_scale" in weight_name or "weight_scale" in weight_name:
+        #     param_data[expert_id] = loaded_weight
 
     def process_weights_after_loading(self):
         # Fp8 is the only case where we need to process after loading.
@@ -314,45 +362,53 @@ class EPMixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         
         # the below version just Simulates the execution of all2all communication and are fully load balanced
-        
-        # router_logits: (num_tokens, n_experts)
         # TODO: reorder hidden_states of tokens based on device_ids and start all-to-all comm
         # can try all-to-all implementation in Tutel or Hetu or FasterMoE; perhaps will need layout transform before all-to-all
         # example: deepspeed moe_inference: dependent on padding and there is a lot of redundant communication
         # and get max_padding_size by all_reduce
         # so perhaps we can use alltoall to get the split_sizes?
         # UPDATE1: A version by padding adapted from Deepspeed
-        router_logits, _ = self.gate(hidden_states)
-        dispatched_input, combine_weights = gate_and_alltoall(router_logits, hidden_states, self.top_k)
+        if self.use_padding:
+            router_logits, _ = self.gate(hidden_states) # router_logits: (num_tokens, n_experts)
+            hacked_router_logits = torch.rand_like(router_logits, dtype=torch.float)
+            dispatched_input, combined_weights = gate_and_alltoall(hacked_router_logits, hidden_states, self.top_k) #[n*e/n, c, m], [s,e,c]
+            # print(f"dispatched_input: {dispatched_input.shape} | combined_weights: {combined_weights.shape} \
+            #       | w13 and w2: {self.w13_weight.shape} + {self.w2_weight.shape}")
+        else:
+            router_logits, _ = self.gate(hidden_states) # router_logits: (num_tokens, n_experts)
+            hacked_router_logits = torch.rand_like(router_logits, dtype=torch.float)
+            dispatched_input, combined_weights = gate_and_alltoall_sparse(hacked_router_logits, hidden_states, self.top_k)
         
-        # TODO: after all-to-all comm, I hope every token will have its corresponding expert_id, or by gate again?
-        # this a common problem in training: after all-to-all, how do I know which expert each token corresponds to
-        # TODO: then sort tokens by expert_ids (but the corresponding logits weight is not needed); 
-        # then start experts computing and restore the order before sorting by expert_ids
-        # need modify the fused_moe kernel, maybe fuse sort and restore into computing kernel?
-        # example: deepspeed moe_inference: by padding it can easily get the tokens of each expert
-        # If we use alltoall to get the split_sizes, we can easily find tokens of each expert
-        
-        # function(hidden_state, w13_weight, w2_weight, token2expert_id)
-        final_hidden_states = fused_moe_ep(dispatch_output,
+        if self.use_padding:
+            # UPDATE1: A version by padding adapted from Deepspeed
+            num_worker = get_expert_parallel_world_size()
+            num_expert = dispatched_input.shape[0] // num_worker
+            capcity = dispatched_input.shape[1]
+            m = dispatched_input.shape[-1]
+            final_hidden_states = fused_moe_ep(dispatched_input,
                                         self.w13_weight,
                                         self.w2_weight,
-                                        router_logits,
+                                        self.num_total_experts,
                                         self.top_k,
-                                        renormalize=True,
+                                        padded=self.use_padding,
                                         inplace=True,
                                         use_fp8=self.use_fp8,
                                         w1_scale=self.w13_scale,
                                         w2_scale=self.w2_scale,
                                         a1_scale=self.a13_scale,
                                         a2_scale=self.a2_scale)
+            final_hidden_states = final_hidden_states.view(num_expert, num_worker, capcity, m).transpose_(0, 1).contiguous() # [nw, ne, c, m]
 
-        # TODO: execute the all-to-all comm and restore the original order
-        dispatch_output = torch.empty_like(final_hidden_states)
-        torch.distributed.all_to_all_single(dispatch_output, final_hidden_states, group=get_tensor_model_parallel_group())
+        if self.use_padding:
+            # UPDATE1: A version by padding adapted from Deepspeed
+            dispatch_output = torch.empty_like(final_hidden_states)
+            torch.distributed.all_to_all_single(dispatch_output, final_hidden_states, group=get_expert_parallel_group())
         
         # compute dispatch_output with router_logits
-        output = torch.sum((dispatch_output * topk_weights.view(-1, 1)).view(num_tokens, self.top_k, hidden_size), dim=1)
+        # UPDATE1: A version by padding adapted from Deepspeed (will cause many redundant comm and comp)
+        output = torch.matmul(
+            combined_weights.type_as(hidden_states).reshape(combined_weights.shape[0], -1),
+            dispatch_output.reshape(-1, dispatch_output.shape[-1])) # [s,e,c]*[e,c,m], s = num_tokens here
 
         return output.view(num_tokens, hidden_size)
 
@@ -371,6 +427,7 @@ class MixtralAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        # TODO: Tensor-parallel is not enabled at this moment, each worker have all attention heads
         # tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         # assert self.total_num_heads % tp_size == 0
@@ -439,11 +496,11 @@ class MixtralAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
-        output, _ = self.o_proj(attn_output)
+        output = self.o_proj(attn_output)
         return output
 
 
@@ -467,11 +524,15 @@ class EPMixtralDecoderLayer(nn.Module):
             rope_theta=rope_theta,
             cache_config=cache_config,
             quant_config=quant_config)
+        expert_parallel_size = get_expert_parallel_world_size()
+        assert config.num_local_experts % expert_parallel_size == 0
         self.block_sparse_moe = EPMixtralMoE(
-            num_experts=config.num_local_experts,
+            num_local_experts=config.num_local_experts // expert_parallel_size,
+            num_total_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
+            use_padding=False, # use_padding=True
             quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -528,6 +589,7 @@ class EPMoEModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
+        assert get_tensor_model_parallel_world_size() == 1, "only support tp=1 now"
         self.layers = nn.ModuleList([
             EPMixtralDecoderLayer(config,
                                 cache_config,

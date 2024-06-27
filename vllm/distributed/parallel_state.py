@@ -20,6 +20,10 @@ _TP_DEVICE_GROUP: Optional[ProcessGroup] = None
 _TP_CPU_GROUP: Optional[ProcessGroup] = None
 _TP_PYNCCL_COMMUNICATOR = None
 _TP_CA_COMMUNICATOR = None
+# Expert parallel group that the current rank belongs to.
+_EP_DEVICE_GROUP: Optional[ProcessGroup] = None
+_EP_CPU_GROUP: Optional[ProcessGroup] = None
+_EP_PYNCCL_COMMUNICATOR = None
 # Pipeline model parallel group that the current rank belongs to.
 _PP_DEVICE_GROUP: Optional[ProcessGroup] = None
 _PP_CPU_GROUP: Optional[ProcessGroup] = None
@@ -223,6 +227,154 @@ def initialize_model_parallel(
             device=_LOCAL_RANK,
         )
 
+def initialize_expert_model_parallel(
+    expert_parallel_size: int = 1,
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    backend: Optional[str] = None,
+) -> None:
+    """
+    Initialize model parallel groups.
+
+    Arguments:
+        expert_parallel_size: number of GPUs used for expert
+            parallelism.
+        tensor_model_parallel_size: number of GPUs used for tensor model
+            parallelism.
+        pipeline_model_parallel_size: number of GPUs used for pipeline model
+            parallelism.
+    
+    If Ep=4 and Tp=1: 
+        4 tensor model-parallel groups: [g0], [g1], [g2], [g3]
+        1 expert parallel group: [g0, g1, g2, g3]
+    If Ep=1 and Tp=4: 
+        1 tensor model-parallel groups: [g0, g1, g2, g3]
+        4 expert parallel group: [g0], [g1], [g2], [g3]
+
+    If Ep=2 and Tp=2: which is less use
+        2 tensor model-parallel groups: [g0, g1], [g2, g3]
+        2 expert parallel group: [g0, g2], [g1, g3]
+    If Ep=2 and Tp=2 and Pp=2: which is less use
+        4 tensor model-parallel groups: [g0, g1], [g2, g3], [g4, g5], [g6, g7]
+        4 expert parallel group: [g0, g2], [g1, g3], [g4, g6], [g5, g7]
+        4 pipeline model-parallel group: [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+
+    Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
+    use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
+    the model pipeline. The present function will
+    create 4 tensor model-parallel groups and 2 pipeline model-parallel groups:
+        4 tensor model-parallel groups:
+            [g0, g1], [g2, g3], [g4, g5], [g6, g7]
+        2 pipeline model-parallel groups:
+            [g0, g2, g4, g6], [g1, g3, g5, g7]
+    Note that for efficiency, the caller should make sure adjacent ranks
+    are on the same DGX box. For example if we are using 2 DGX-1 boxes
+    with a total of 16 GPUs, rank 0 to 7 belong to the first box and
+    ranks 8 to 15 belong to the second box.
+    """
+    # Get world size and rank. Ensure some consistencies.
+    assert torch.distributed.is_initialized()
+    world_size: int = torch.distributed.get_world_size()
+    # get the backend of _DEVICE_WORLD_GROUP
+    backend = backend or torch.distributed.get_backend()
+
+    if (world_size !=
+            expert_parallel_size * tensor_model_parallel_size * pipeline_model_parallel_size):
+        raise RuntimeError(
+            f"world_size ({world_size}) is not equal to "
+            f"expert_parallel_size ({expert_parallel_size}) x "
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})")
+
+    num_expert_parallel_groups: int = (world_size //
+                                             expert_parallel_size)
+    num_tensor_model_parallel_groups: int = (world_size //
+                                             tensor_model_parallel_size)
+    num_pipeline_model_parallel_groups: int = (world_size //
+                                               pipeline_model_parallel_size)
+    rank = torch.distributed.get_rank()
+
+    # Build the tensor model-parallel groups.
+    global _TP_DEVICE_GROUP, _TP_CPU_GROUP
+    global _TP_PYNCCL_COMMUNICATOR, _TP_CA_COMMUNICATOR
+    assert _TP_DEVICE_GROUP is None, (
+        "tensor model parallel group is already initialized")
+    for i in range(num_tensor_model_parallel_groups):
+        ranks = list(
+            range(i * tensor_model_parallel_size,
+                  (i + 1) * tensor_model_parallel_size))
+        group = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+        if rank in ranks:
+            logger.info(f"TP groups: {ranks}")
+            _TP_DEVICE_GROUP = group
+            _TP_CPU_GROUP = cpu_group
+
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    if tensor_model_parallel_size > 1:
+        _TP_PYNCCL_COMMUNICATOR = PyNcclCommunicator(
+            group=_TP_CPU_GROUP,
+            device=_LOCAL_RANK,
+        )
+
+    # Initialize a custom fast all-reduce implementation.
+    if _ENABLE_CUSTOM_ALL_REDUCE:
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce)
+        _TP_CA_COMMUNICATOR = CustomAllreduce(
+            group=_TP_CPU_GROUP,
+            device=_LOCAL_RANK,
+        )
+
+    # Build the expert parallel groups.
+    global _EP_DEVICE_GROUP, _EP_CPU_GROUP
+    global _EP_PYNCCL_COMMUNICATOR
+    assert _EP_DEVICE_GROUP is None, (
+        "expert parallel group is already initialized")
+    for i in range(num_expert_parallel_groups):
+        # num_ep_group_per_pp_level = tensor_model_parallel_size
+        # pp_level = i // num_ep_group_per_pp_level
+        pp_level = i // tensor_model_parallel_size
+        k = expert_parallel_size * tensor_model_parallel_size
+        j = i % num_expert_parallel_groups
+        ranks = list(
+            range(pp_level * k + j, (pp_level + 1) * k, tensor_model_parallel_size))
+        group = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+        if rank in ranks:
+            logger.info(f"EP groups: {ranks}")
+            _EP_DEVICE_GROUP = group
+            _EP_CPU_GROUP = cpu_group
+
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    if expert_parallel_size > 1:
+        _EP_PYNCCL_COMMUNICATOR = PyNcclCommunicator(
+            group=_EP_CPU_GROUP,
+            device=_LOCAL_RANK,
+        )
+    
+    # Build the pipeline model-parallel groups.
+    global _PP_DEVICE_GROUP, _PP_CPU_GROUP
+    global _PP_PYNCCL_COMMUNICATOR
+    global _PP_GLOBAL_RANKS
+    assert _PP_DEVICE_GROUP is None, (
+        "pipeline model parallel group is already initialized")
+    for i in range(num_pipeline_model_parallel_groups):
+        ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
+        group = torch.distributed.new_group(ranks, backend=backend)
+        cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+        if rank in ranks:
+            logger.info(f"PP groups: {ranks}")
+            _PP_DEVICE_GROUP = group
+            _PP_CPU_GROUP = cpu_group
+            _PP_GLOBAL_RANKS = ranks
+
+    if pipeline_model_parallel_size > 1:
+        _PP_PYNCCL_COMMUNICATOR = PyNcclCommunicator(
+            group=_PP_CPU_GROUP,
+            device=_LOCAL_RANK,
+        )
+
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
@@ -251,11 +403,44 @@ def ensure_model_parallel_initialized(
         f"{get_pipeline_model_parallel_world_size()=} vs. "
         f"{pipeline_model_parallel_size=}")
 
+def ensure_expert_model_parallel_initialized(
+    expert_parallel_size: int,
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    backend: Optional[str] = None,
+) -> None:
+    """Helper to initialize model parallel groups if they are not initialized,
+    or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
+    values if the model parallel groups are initialized.
+    """
+    # get the backend of _DEVICE_WORLD_GROUP
+    backend = backend or torch.distributed.get_backend()
+    if not expert_model_parallel_is_initialized():
+        initialize_expert_model_parallel(expert_parallel_size, tensor_model_parallel_size,
+                                  pipeline_model_parallel_size, backend)
+        return
+
+    assert (
+        get_tensor_model_parallel_world_size() == tensor_model_parallel_size
+    ), ("tensor parallel group already initialized, but of unexpected size: "
+        f"{get_tensor_model_parallel_world_size()=} vs. "
+        f"{tensor_model_parallel_size=}")
+    assert (get_pipeline_model_parallel_world_size() == pipeline_model_parallel_size), (
+        "pipeline parallel group already initialized, but of unexpected size: "
+        f"{get_pipeline_model_parallel_world_size()=} vs. "
+        f"{pipeline_model_parallel_size=}")
+    assert (get_expert_parallel_world_size() == expert_parallel_size), (
+        "pipeline parallel group already initialized, but of unexpected size: "
+        f"{get_expert_parallel_world_size()=} vs. "
+        f"{expert_parallel_size=}")
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
     return (_TP_DEVICE_GROUP is not None and _PP_DEVICE_GROUP is not None)
 
+def expert_model_parallel_is_initialized():
+    """Check if tensor and pipeline parallel groups are initialized."""
+    return (_TP_DEVICE_GROUP is not None and _PP_DEVICE_GROUP is not None and _EP_DEVICE_GROUP is not None)
 
 def get_cpu_world_group():
     """Get the CPU world group."""
@@ -268,6 +453,12 @@ def get_tensor_model_parallel_group():
     assert _TP_DEVICE_GROUP is not None, (
         "tensor model parallel group is not initialized")
     return _TP_DEVICE_GROUP
+
+def get_expert_parallel_group():
+    """Get the expert parallel group the caller rank belongs to."""
+    assert _EP_DEVICE_GROUP is not None, (
+        "expert parallel group is not initialized")
+    return _EP_DEVICE_GROUP
 
 
 def get_tensor_model_parallel_cpu_group():
@@ -296,6 +487,10 @@ def get_tensor_model_parallel_world_size():
     return torch.distributed.get_world_size(
         group=get_tensor_model_parallel_group())
 
+def get_expert_parallel_world_size():
+    """Return world size for the expert parallel group."""
+    return torch.distributed.get_world_size(
+        group=get_expert_parallel_group())
 
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
@@ -306,6 +501,10 @@ def get_pipeline_model_parallel_world_size():
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
+
+def get_expert_parallel_rank():
+    """Return my rank for the expert parallel group."""
+    return torch.distributed.get_rank(group=get_expert_parallel_group())
 
 
 def get_pipeline_model_parallel_rank():
@@ -321,6 +520,12 @@ def get_tensor_model_parallel_src_rank():
     local_world_size = get_tensor_model_parallel_world_size()
     return (global_rank // local_world_size) * local_world_size
 
+def get_expert_parallel_src_rank():
+    """Calculate the global rank corresponding to the first local rank
+    in the expert parallel group."""
+    global_rank = torch.distributed.get_rank()
+    local_world_size = get_expert_parallel_world_size()
+    return (global_rank // local_world_size) * local_world_size
 
 def get_pipeline_model_parallel_first_rank():
     """Return the global rank of the first process in the pipeline for the
@@ -363,6 +568,7 @@ def destroy_model_parallel():
     if _TP_DEVICE_GROUP:
         torch.distributed.destroy_process_group(_TP_DEVICE_GROUP)
     _TP_DEVICE_GROUP = None
+    _EP_DEVICE_GROUP = None
     global _TP_CPU_GROUP
     if _TP_CPU_GROUP:
         torch.distributed.destroy_process_group(_TP_CPU_GROUP)

@@ -11,8 +11,12 @@ from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          SpeculativeConfig, VisionLanguageConfig)
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
+                              ensure_expert_model_parallel_initialized,
                               init_distributed_environment,
-                              set_custom_all_reduce)
+                              set_custom_all_reduce,
+                              get_expert_parallel_world_size,
+                              get_expert_parallel_group,
+                              get_expert_parallel_src_rank)
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.sequence import ExecuteModelRequest, PoolerOutput, SamplerOutput
@@ -151,7 +155,9 @@ class Worker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        print("starting profile running!")
         self.model_runner.profile_run()
+        print("profile running completed!")
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
@@ -261,7 +267,7 @@ class Worker(WorkerBase):
             "blocks_to_swap_out": blocks_to_swap_out,
             "blocks_to_copy": blocks_to_copy,
         }
-        broadcast_tensor_dict(data, src=0)
+        broadcast_tensor_dict(data, src=0) # TODO: need to be modified here
 
         self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
 
@@ -271,6 +277,16 @@ class Worker(WorkerBase):
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
                                                  self.gpu_cache)
+        # print(f"{torch.distributed.get_rank()} | {output}")
+        # driver_worker gather the output result from all workers
+        if get_expert_parallel_world_size() > 1:
+            object_gather_list = [None for _ in range(get_expert_parallel_world_size())]
+            torch.distributed.gather_object(output, object_gather_list, dst=0, group=get_expert_parallel_group())
+            output = object_gather_list[0]
+            for x in object_gather_list[1:]:
+                output += x
+            output.outputs.sort(key=lambda CSGOutput: CSGOutput.samples[0].parent_seq_id)
+            return [output]
 
         # Worker only supports single-step execution. Wrap the output in a list
         # to conform to interface.
@@ -292,7 +308,7 @@ class Worker(WorkerBase):
         Returns True iff there are remaining sequences to process.
         """
         assert not self.is_driver_worker
-        data = broadcast_tensor_dict(src=0)
+        data = broadcast_tensor_dict(src=0) # TODO: If the requests among all workers are different, the KV cache management should be modified
         if not data:
             return False
 
@@ -306,7 +322,13 @@ class Worker(WorkerBase):
         if num_seq_groups == 0:
             return False
 
-        self.model_runner.execute_model(None, self.gpu_cache)
+        output = self.model_runner.execute_model(None, self.gpu_cache)
+        # print(f"{torch.distributed.get_rank()} | {output}")
+
+        # driver_worker gather the output result from all workers
+        if get_expert_parallel_world_size() > 1:
+            torch.distributed.gather_object(output, None, dst=get_expert_parallel_src_rank(), group=get_expert_parallel_group())
+
         return True
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -346,7 +368,7 @@ def init_worker_distributed_environment(
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank)
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
+    ensure_expert_model_parallel_initialized(parallel_config.expert_parallel_size, parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 
 

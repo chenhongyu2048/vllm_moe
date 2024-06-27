@@ -39,6 +39,7 @@ class EngineArgs:
     distributed_executor_backend: Optional[str] = None
     pipeline_parallel_size: int = 1
     tensor_parallel_size: int = 1
+    expert_parallel_size: int = 1
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
     enable_prefix_caching: bool = False
@@ -305,6 +306,11 @@ class EngineArgs:
                             type=int,
                             default=EngineArgs.tensor_parallel_size,
                             help='Number of tensor parallel replicas.')
+        parser.add_argument('--expert-parallel-size',
+                            '-ep',
+                            type=int,
+                            default=EngineArgs.expert_parallel_size,
+                            help='Number of expert parallel replicas.')
         parser.add_argument(
             '--max-parallel-loading-workers',
             type=int,
@@ -652,6 +658,7 @@ class EngineArgs:
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
+            expert_parallel_size=self.expert_parallel_size,
             worker_use_ray=self.worker_use_ray,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,

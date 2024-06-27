@@ -804,6 +804,13 @@ class SamplerOutput:
         return isinstance(other,
                           self.__class__) and self.outputs == other.outputs
 
+    def __add__(self, other):
+        if isinstance(other, SamplerOutput):
+            self.outputs.extend(other.outputs)
+            return self
+        else:
+            raise TypeError("Unsupported operand type for +: 'SamplerOutput' and '{}'".format(type(other).__name__))
+
     def __repr__(self) -> str:
         """Show the shape of a tensor instead of its values to reduce noise.
         """

@@ -11,7 +11,7 @@ from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
                          VisionLanguageConfig)
-from vllm.distributed import broadcast_tensor_dict
+from vllm.distributed import broadcast_tensor_dict, get_expert_parallel_world_size, get_tensor_model_parallel_group
 from vllm.distributed.communication_op import graph_capture
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
@@ -685,9 +685,9 @@ class ModelRunner:
             }
             if attn_metadata:
                 metadata_dict.update(attn_metadata.asdict_zerocopy())
-            broadcast_tensor_dict(metadata_dict, src=0)
+            broadcast_tensor_dict(metadata_dict, src=0, group=get_tensor_model_parallel_group())
         else:
-            metadata_dict = broadcast_tensor_dict(src=0)
+            metadata_dict = broadcast_tensor_dict(src=0, group=get_tensor_model_parallel_group())
             input_tokens = metadata_dict.pop("input_tokens")
             input_positions = metadata_dict.pop("input_positions")
             selected_token_indices = metadata_dict.pop(
@@ -711,15 +711,89 @@ class ModelRunner:
                 sampling_metadata, lora_requests, lora_mapping,
                 multi_modal_kwargs)
 
+    def prepare_input_tensors_ep(
+        self,
+        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, SamplingMetadata,
+               Set[LoRARequest], LoRAMapping, Dict[str, torch.Tensor]]:
+        # scatter the seq_group to all workers
+        # TODO: this version only consider tensor_parallel=1, pipeline_parallel=1 and expert_parallel>1
+        if self.is_driver_worker:
+            assert seq_group_metadata_list is not None
+            group = torch.distributed.group.WORLD
+            world_size = torch.distributed.get_world_size(group=group)
+            splited_seq_group_metadata_list = [[] for _ in range(world_size)]
+            for i, seq_group_metadata in enumerate(seq_group_metadata_list):
+                    splited_seq_group_metadata_list[i % world_size].append(seq_group_metadata)
+            output_list = [None]
+            torch.distributed.scatter_object_list(output_list, splited_seq_group_metadata_list, src=0)
+        else:
+            group = torch.distributed.group.WORLD
+            world_size = torch.distributed.get_world_size(group=group)
+            output_list = [None]
+            objects = [None for _ in range(world_size)]
+            torch.distributed.scatter_object_list(output_list, objects, src=0)
+        
+        seq_group_metadata_list = output_list[0]
+        assert seq_group_metadata_list is not None
+        # Prepare input tensors.
+        (
+            input_tokens,
+            input_positions,
+            attn_metadata,
+            seq_lens,
+            query_lens,
+            lora_mapping,
+            lora_requests,
+            multi_modal_kwargs,
+            slot_mapping,
+            num_prefill_tokens,
+            num_decode_tokens,
+            num_prefills,
+        ) = self._prepare_model_input(seq_group_metadata_list)
+        sampling_metadata = SamplingMetadata.prepare(
+            seq_group_metadata_list, seq_lens, query_lens, self.device,
+            self.pin_memory)
+
+        metadata_dict = {
+            "input_tokens": input_tokens,
+            "input_positions": input_positions,
+            "selected_token_indices":
+            sampling_metadata.selected_token_indices,
+            "lora_requests": lora_requests,
+            "lora_mapping": lora_mapping,
+            "multi_modal_kwargs": multi_modal_kwargs,
+            "num_prefill_tokens": num_prefill_tokens,
+            "num_decode_tokens": num_decode_tokens,
+            "slot_mapping": slot_mapping,
+            "num_prefills": num_prefills,
+        }
+        if attn_metadata:
+            metadata_dict.update(attn_metadata.asdict_zerocopy())
+        
+        return (input_tokens, input_positions, attn_metadata,
+                sampling_metadata, lora_requests, lora_mapping,
+                multi_modal_kwargs)
+
     @torch.inference_mode()
     def execute_model(
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
         kv_caches: List[torch.Tensor],
     ) -> Optional[SamplerOutput]:
-        (input_tokens, input_positions, attn_metadata, sampling_metadata,
-         lora_requests, lora_mapping, multi_modal_kwargs
-         ) = self.prepare_input_tensors(seq_group_metadata_list)
+        # if seq_group_metadata_list is not None:
+        #     for x in seq_group_metadata_list:
+        #         print(f"seq_group_metadata: {x.__dict__}")
+
+        # the seq_group_metadatas will be scattered to all ranks if enable expert parallel
+        if get_expert_parallel_world_size() > 1:
+            (input_tokens, input_positions, attn_metadata, sampling_metadata,
+            lora_requests, lora_mapping, multi_modal_kwargs
+            ) = self.prepare_input_tensors_ep(seq_group_metadata_list)
+        else:
+            (input_tokens, input_positions, attn_metadata, sampling_metadata,
+            lora_requests, lora_mapping, multi_modal_kwargs
+            ) = self.prepare_input_tensors(seq_group_metadata_list)
 
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
@@ -744,9 +818,10 @@ class ModelRunner:
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
-        # Only perform sampling in the driver worker.
-        if not self.is_driver_worker:
-            return None
+        if get_expert_parallel_world_size() == 1:
+            # Only perform sampling in the driver worker when no expert parallel.
+            if not self.is_driver_worker:
+                return None
 
         # Sample the next token.
         output = self.model.sample(

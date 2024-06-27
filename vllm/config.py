@@ -421,7 +421,7 @@ class CacheConfig:
         total_cpu_memory = get_cpu_memory()
         # FIXME(woosuk): Here, it is assumed that the GPUs in a tensor parallel
         # group are in the same node. However, the GPUs may span multiple nodes.
-        num_gpus_per_node = parallel_config.tensor_parallel_size
+        num_gpus_per_node = parallel_config.tensor_parallel_size * parallel_config.expert_parallel_size
         cpu_memory_usage = self.swap_space_bytes * num_gpus_per_node
 
         msg = (f"{cpu_memory_usage / _GB:.2f} GiB out of "
@@ -573,6 +573,7 @@ class ParallelConfig:
         self,
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
+        expert_parallel_size: int,
         worker_use_ray: Optional[bool] = None,
         max_parallel_loading_workers: Optional[int] = None,
         disable_custom_all_reduce: bool = False,
@@ -583,6 +584,7 @@ class ParallelConfig:
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
+        self.expert_parallel_size = expert_parallel_size
         self.distributed_executor_backend = distributed_executor_backend
         self.max_parallel_loading_workers = max_parallel_loading_workers
         self.disable_custom_all_reduce = disable_custom_all_reduce
@@ -590,7 +592,7 @@ class ParallelConfig:
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
 
-        self.world_size = pipeline_parallel_size * self.tensor_parallel_size
+        self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size * self.expert_parallel_size
         if worker_use_ray:
             if self.distributed_executor_backend is None:
                 self.distributed_executor_backend = "ray"
@@ -941,9 +943,9 @@ class SpeculativeConfig:
         draft worker can have a different parallel strategy, e.g. TP=1.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.
-            pipeline_parallel_size,
+            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
             tensor_parallel_size=target_parallel_config.tensor_parallel_size,
+            expert_parallel_size=target_parallel_config.expert_parallel_size,
             distributed_executor_backend=target_parallel_config.
             distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.

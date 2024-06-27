@@ -224,10 +224,11 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        hacked_router_logits = torch.rand_like(router_logits, dtype=torch.float)
         final_hidden_states = fused_moe(hidden_states,
                                         self.w13_weight,
                                         self.w2_weight,
-                                        router_logits,
+                                        hacked_router_logits,
                                         self.top_k,
                                         renormalize=True,
                                         inplace=True,

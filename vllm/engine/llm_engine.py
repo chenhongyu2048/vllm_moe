@@ -38,6 +38,7 @@ from vllm.transformers_utils.tokenizer_group import (BaseTokenizerGroup,
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import Counter
+import time, torch
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 1 # 5 in original vLLM
@@ -164,7 +165,7 @@ class LLMEngine:
             "skip_tokenizer_init=%s, tokenizer_mode=%s, revision=%s, "
             "rope_scaling=%r, tokenizer_revision=%s, "
             "trust_remote_code=%s, dtype=%s, max_seq_len=%d, "
-            "download_dir=%r, load_format=%s, tensor_parallel_size=%d, "
+            "download_dir=%r, load_format=%s, tensor_parallel_size=%d, expert_parallel_size=%d, "
             "disable_custom_all_reduce=%s, quantization=%s, "
             "enforce_eager=%s, kv_cache_dtype=%s, "
             "quantization_param_path=%s, device_config=%s, "
@@ -184,6 +185,7 @@ class LLMEngine:
             load_config.download_dir,
             load_config.load_format,
             parallel_config.tensor_parallel_size,
+            parallel_config.expert_parallel_size,
             parallel_config.disable_custom_all_reduce,
             model_config.quantization,
             model_config.enforce_eager,
@@ -546,6 +548,7 @@ class LLMEngine:
         processed_inputs = self.process_model_inputs(request_id=request_id,
                                                      inputs=inputs,
                                                      lora_request=lora_request)
+        # print(f"req_id: {request_id} | {processed_inputs}")
 
         self._add_processed_request(
             request_id=request_id,
@@ -769,8 +772,17 @@ class LLMEngine:
                 num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
                 running_queue_size=scheduler_outputs.running_queue_size,
             )
+
+            # distributed_gpu_executor._driver_execute_model -> ray_gpu_executor.execute_model 
+            # -> ray_gpu_executor: driver_worker.execute_method-"execute_model" -> for driver_worker: execute_model
+            # for normal worker: _execute_model_non_driver
+            torch.cuda.synchronize()
+            t0 = time.time()
             output = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
+            torch.cuda.synchronize()
+            t1 = time.time()
+            print(f"Time for one step: {(t1 - t0)*1000:.4f} ms")
         else:
             output = []
 

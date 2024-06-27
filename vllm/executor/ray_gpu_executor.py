@@ -184,7 +184,7 @@ class RayGPUExecutor(DistributedGPUExecutor):
         loop running in each of the remote workers.
         """
         return self.driver_worker.execute_method("execute_model",
-                                                 execute_model_req) # in vllm.worker.Worker, will call model_runner.execute_model()
+                                                 execute_model_req) # in vllm.worker.Worker,from worker.execute_model(), will call model_runner.execute_model()
 
     def _run_workers(
         self,
